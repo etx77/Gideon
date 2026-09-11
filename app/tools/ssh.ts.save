@@ -1,0 +1,624 @@
+import { tool } from "@openai/agents";
+import { z } from "zod";
+import { NodeSSH, Config } from "node-ssh";
+
+type SshSession = {
+  ssh: NodeSSH;
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+  key: string;
+  execLock: Promise<void>;
+};
+
+const sessions = new Map<string, SshSession>();
+
+function sessionKey(
+  host: string,
+  port: number,
+  username: string
+): string {
+  return `${username}@${host}:${port}`;
+}
+
+/**
+ * Serializza gli exec sulla stessa sessione.
+ *
+ * Evita che due comandi contemporanei utilizzino
+ * contemporaneamente lo stesso canale SSH.
+ */
+async function executeLocked<T>(
+  session: SshSession,
+  fn: () => Promise<T>
+): Promise<T> {
+  let releaseLock!: () => void;
+
+  const previousLock = session.execLock;
+
+  session.execLock = new Promise<void>((resolve) => {
+    releaseLock = resolve;
+  });
+
+  await previousLock;
+
+  try {
+    return await fn();
+  } finally {
+    releaseLock();
+  }
+}
+
+/**
+ * Connette una nuova sessione SSH oppure riutilizza
+ * quella già esistente per user@host:port.
+ */
+async function connectSsh(
+  host: string,
+  port: number,
+  username: string,
+  password: string
+): Promise<{
+  sessionId: string;
+  reused: boolean;
+}> {
+  const key = sessionKey(
+    host,
+    port,
+    username
+  );
+
+  const existing = sessions.get(key);
+
+  if (existing) {
+    console.log(
+      `[SSH] Reusing existing session ${key}`
+    );
+
+    return {
+      sessionId: key,
+      reused: true,
+    };
+  }
+
+  console.log(
+    `[SSH] Connecting to ${username}@${host}:${port}`
+  );
+
+  const ssh = new NodeSSH();
+
+  const config: Config = {
+    host,
+    port,
+    username,
+    password,
+
+    readyTimeout: 15000,
+
+    keepaliveInterval: 10000,
+    keepaliveCountMax: 3,
+
+    // Manteniamo il comportamento precedente.
+    // In produzione è meglio usare la verifica della
+    // host key tramite known_hosts.
+    hostVerifier: () => true,
+  };
+
+  try {
+    await ssh.connect(config);
+
+    console.log(
+      `[SSH] Connection ready ${username}@${host}:${port}`
+    );
+  } catch (error) {
+    console.error(
+      `[SSH] Connection error ${username}@${host}:${port}:`,
+      error
+    );
+
+    ssh.dispose();
+
+    throw error;
+  }
+
+  const session: SshSession = {
+    ssh,
+    host,
+    port,
+    username,
+    password,
+    key,
+    execLock: Promise.resolve(),
+  };
+
+  sessions.set(key, session);
+
+  console.log(
+    `[SSH] Persistent session opened ${key}`
+  );
+
+  return {
+    sessionId: key,
+    reused: false,
+  };
+}
+
+/**
+ * Esegue un comando sulla sessione SSH.
+ *
+ * node-ssh usa direttamente il channel exec di SSH:
+ *
+ * - stdout reale
+ * - stderr reale
+ * - exit code reale
+ *
+ * Non utilizziamo più marker, PTY o parsing dell'output.
+ */
+async function executeCommand(
+  session: SshSession,
+  command: string,
+  timeoutMs: number
+): Promise<{
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+}> {
+  return executeLocked(
+    session,
+    async () => {
+      console.log(
+        `[SSH] EXEC ${session.username}@${session.host}: ${command}`
+      );
+
+      /*
+       * Se il comando inizia con sudo, utilizziamo:
+       *
+       *   sudo -S -p ''
+       *
+       * e passiamo la password attraverso stdin.
+       *
+       * La password quindi NON viene inserita nella
+       * command line del processo remoto.
+       */
+      let remoteCommand = command;
+      let stdin: string | undefined;
+
+      if (/^\s*sudo(?:\s|$)/i.test(command)) {
+        remoteCommand = command.replace(
+          /^\s*sudo\b/i,
+          "sudo -S -p ''"
+        );
+
+        stdin = `${session.password}\n`;
+
+        console.log(
+          `[SSH] sudo detected, password will be sent through stdin`
+        );
+      }
+
+      let timeoutHandle:
+        | NodeJS.Timeout
+        | undefined;
+
+      const resultPromise =
+        session.ssh.execCommand(
+          remoteCommand,
+          {
+            stdin,
+
+            onStdout(chunk) {
+              console.log(
+                `[SSH] STDOUT ${session.username}@${session.host}: ${chunk.toString()}`
+              );
+            },
+
+            onStderr(chunk) {
+              console.log(
+                `[SSH] STDERR ${session.username}@${session.host}: ${chunk.toString()}`
+              );
+            },
+          }
+        );
+
+      const timeoutPromise =
+        new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(() => {
+            reject(
+              new Error(
+                `Timeout durante l'esecuzione del comando (${timeoutMs} ms)`
+              )
+            );
+          }, timeoutMs);
+        });
+
+      try {
+        const result = await Promise.race([
+          resultPromise,
+          timeoutPromise,
+        ]);
+
+        return {
+          stdout: result.stdout ?? "",
+          stderr: result.stderr ?? "",
+          exitCode:
+            typeof result.code === "number"
+              ? result.code
+              : null,
+        };
+      } finally {
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle);
+        }
+      }
+    }
+  );
+}
+
+export const sshTool = tool({
+  name: "ssh",
+
+  description: `
+Gestisce sessioni SSH persistenti e generiche verso macchine remote.
+
+Il tool può:
+
+- aprire una connessione SSH
+- riutilizzare automaticamente una sessione già aperta
+- eseguire qualsiasi comando Linux
+- mantenere una connessione SSH persistente
+- eseguire comandi in sequenza sulla stessa sessione
+- gestire automaticamente sudo
+- leggere stdout reale
+- leggere stderr reale
+- ottenere l'exit code reale
+- chiudere la sessione
+
+REGOLE:
+
+1. La sessione è identificata internamente da:
+
+   username + host + porta
+
+2. Se esiste già una sessione SSH attiva verso lo stesso
+   username@host:porta, NON viene aperta una nuova connessione.
+
+3. Gli ID di sessione vengono generati dal tool.
+   Il modello NON deve inventarli.
+
+4. Dopo connect, exec utilizza automaticamente la sessione
+   corretta.
+
+5. NON sostituire mai l'host fornito dall'utente con
+   localhost o 127.0.0.1.
+
+6. NON aprire una nuova connessione se esiste già una
+   sessione attiva verso la stessa macchina.
+
+7. Gli exec sulla stessa sessione vengono serializzati.
+   Un comando viene completato prima di iniziare il successivo.
+
+8. Se il comando inizia con sudo, il tool utilizza
+   automaticamente la password SSH fornita durante connect.
+
+9. La password sudo viene inviata attraverso stdin e non
+   viene restituita nel risultato.
+
+10. stdout e stderr devono essere restituiti separatamente.
+
+11. L'exit code deve essere quello reale restituito dal
+    comando remoto.
+
+12. exitCode=0 significa che il comando è terminato
+    correttamente.
+
+13. exitCode diverso da 0 significa che il comando
+    remoto è terminato con errore.
+
+14. exitCode=null significa che il risultato non contiene
+    un exit code verificabile.
+
+15. Il tool è completamente generico.
+    Può essere utilizzato per qualsiasi attività
+    amministrativa Linux richiesta dall'utente.
+
+16. Non inventare mai output, stderr, exit code,
+    hostname, processi o risultati.
+
+17. Il comando deve essere realmente eseguito sulla
+    macchina remota.
+
+18. Se un comando termina con errore, restituisci
+    l'output reale e l'exit code reale.
+
+19. Se la sessione non esiste più, non fingere che
+    il comando sia stato eseguito.
+`,
+
+  parameters: z.object({
+    action: z
+      .enum(["connect", "exec", "close"])
+      .describe("Operazione SSH"),
+
+    host: z
+      .string()
+      .optional()
+      .describe("Hostname o indirizzo IP remoto"),
+
+    port: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .default(22)
+      .describe("Porta SSH"),
+
+    username: z
+      .string()
+      .optional()
+      .describe("Utente SSH"),
+
+    password: z
+      .string()
+      .optional()
+      .describe("Password SSH"),
+
+    session_id: z
+      .string()
+      .optional()
+      .describe(
+        "ID sessione restituito dal tool. Non inventarlo."
+      ),
+
+    command: z
+      .string()
+      .optional()
+      .describe("Comando Linux da eseguire"),
+
+    timeout_ms: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .default(120000)
+      .describe(
+        "Timeout comando in millisecondi"
+      ),
+  }),
+
+  async execute({
+    action,
+    host,
+    port,
+    username,
+    password,
+    session_id,
+    command,
+    timeout_ms,
+  }) {
+    /*
+     * CONNECT
+     */
+    if (action === "connect") {
+      if (!host || !username || !password) {
+        throw new Error(
+          "Per connect sono necessari host, username e password."
+        );
+      }
+
+      const sshPort = port ?? 22;
+
+      const result = await connectSsh(
+        host,
+        sshPort,
+        username,
+        password
+      );
+
+      return JSON.stringify({
+        success: true,
+        session_id: result.sessionId,
+        host,
+        port: sshPort,
+        username,
+        reused: result.reused,
+
+        message: result.reused
+          ? "Sessione SSH già attiva: connessione riutilizzata."
+          : "Nuova sessione SSH aperta e mantenuta.",
+      });
+    }
+
+    /*
+     * CLOSE
+     */
+    if (action === "close") {
+      if (!session_id) {
+        throw new Error(
+          "session_id obbligatorio."
+        );
+      }
+
+      const session =
+        sessions.get(session_id);
+
+      if (!session) {
+        return JSON.stringify({
+          success: false,
+          session_id,
+          error:
+            "Sessione SSH non trovata o già chiusa.",
+        });
+      }
+
+      console.log(
+        `[SSH] Closing session ${session_id}`
+      );
+
+      session.ssh.dispose();
+
+      sessions.delete(session_id);
+
+      return JSON.stringify({
+        success: true,
+        session_id,
+        host: session.host,
+        port: session.port,
+        username: session.username,
+
+        message:
+          "Sessione SSH chiusa.",
+      });
+    }
+
+    /*
+     * EXEC
+     */
+    if (action === "exec") {
+      if (!command) {
+        throw new Error(
+          "command obbligatorio."
+        );
+      }
+
+      let session:
+        | SshSession
+        | undefined;
+
+      /*
+       * Prima prova tramite session_id.
+       */
+      if (session_id) {
+        session =
+          sessions.get(session_id);
+      }
+
+      /*
+       * Se non è stato passato session_id,
+       * recupera automaticamente la sessione
+       * tramite username@host:port.
+       */
+      if (!session && host && username) {
+        session =
+          sessions.get(
+            sessionKey(
+              host,
+              port ?? 22,
+              username
+            )
+          );
+      }
+
+      if (!session) {
+        throw new Error(
+          "Nessuna sessione SSH attiva disponibile. " +
+          "Apri prima una sessione con connect."
+        );
+      }
+
+      /*
+       * Verifica che la connessione sia ancora attiva.
+       */
+      if (!session.ssh.isConnected()) {
+        sessions.delete(session.key);
+
+        return JSON.stringify({
+          success: false,
+          session_id: session.key,
+          host: session.host,
+          port: session.port,
+          username: session.username,
+          command,
+          exitCode: null,
+          error:
+            "La sessione SSH non è più connessa.",
+        });
+      }
+
+      try {
+        const result =
+          await executeCommand(
+            session,
+            command,
+            timeout_ms ?? 120000
+          );
+
+        const success =
+          result.exitCode === 0;
+
+        console.log(
+          `[SSH] EXIT ${session.username}@${session.host}: ${result.exitCode}`
+        );
+
+        console.log(
+          `[SSH] STDOUT: ${JSON.stringify(result.stdout)}`
+        );
+
+        console.log(
+          `[SSH] STDERR: ${JSON.stringify(result.stderr)}`
+        );
+
+        return JSON.stringify({
+          success,
+
+          session_id:
+            session.key,
+
+          host:
+            session.host,
+
+          port:
+            session.port,
+
+          username:
+            session.username,
+
+          command,
+
+          exitCode:
+            result.exitCode,
+
+          stdout:
+            result.stdout,
+
+          stderr:
+            result.stderr,
+        });
+      } catch (error) {
+        console.error(
+          `[SSH] EXEC ERROR ${session.username}@${session.host}:`,
+          error
+        );
+
+        return JSON.stringify({
+          success: false,
+
+          session_id:
+            session.key,
+
+          host:
+            session.host,
+
+          port:
+            session.port,
+
+          username:
+            session.username,
+
+          command,
+
+          exitCode:
+            null,
+
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error),
+        });
+      }
+    }
+
+    throw new Error(
+      "Azione SSH non supportata."
+    );
+  },
+});

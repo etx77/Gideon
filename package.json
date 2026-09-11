@@ -1,0 +1,29 @@
+{
+  "name": "nvidia-chat",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@openai/agents": "latest",
+    "adm-zip": "^0.6.0",
+    "cheerio": "^1.2.0",
+    "next": "latest",
+    "node-ssh": "^13.2.1",
+    "openai": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "ssh2": "^1.17.0"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "@types/ssh2": "^1.15.6",
+    "typescript": "latest"
+  }
+}
