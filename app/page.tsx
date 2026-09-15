@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 type Message = {
   role: "user" | "assistant";
@@ -12,6 +12,8 @@ export default function Home() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [model, setModel] = useState("modello non disponibile");
+
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     fetch("/api/model")
@@ -40,6 +42,9 @@ export default function Home() {
     setInput("");
     setLoading(true);
 
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+
     try {
       const response = await fetch("/api/chat", {
         method: "POST",
@@ -48,7 +53,8 @@ export default function Home() {
         },
         body: JSON.stringify({
           messages: updatedMessages
-        })
+        }),
+        signal: abortController.signal
       });
 
       if (!response.ok) {
@@ -90,7 +96,25 @@ export default function Home() {
           }
         ]);
       }
+
+      // Completa eventuali byte rimasti nel decoder
+      assistantText += decoder.decode();
+
+      if (assistantText) {
+        setMessages([
+          ...updatedMessages,
+          {
+            role: "assistant",
+            content: assistantText
+          }
+        ]);
+      }
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        console.log("Richiesta interrotta dall'utente.");
+        return;
+      }
+
       console.error(error);
 
       setMessages([
@@ -101,8 +125,13 @@ export default function Home() {
         }
       ]);
     } finally {
+      abortControllerRef.current = null;
       setLoading(false);
     }
+  }
+
+  function stopMessage() {
+    abortControllerRef.current?.abort();
   }
 
   return (
@@ -189,17 +218,19 @@ export default function Home() {
           >
             <strong>
               {message.role === "user" ? "Lightbringer" : "🤖 Gideon"}
-              
-              
             </strong>
-            
-            
 
-
-
- 
- <div style={{ marginTop: "8px", color: message.role === "assistant" ? "#00ff66" : "#ffff66" }}> {message.content} </div>
-            
+            <div
+              style={{
+                marginTop: "8px",
+                color:
+                  message.role === "assistant"
+                    ? "#00ff66"
+                    : "#ffff66"
+              }}
+            >
+              {message.content}
+            </div>
           </div>
         ))}
       </section>
@@ -224,7 +255,12 @@ export default function Home() {
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
-                sendMessage();
+
+                if (loading) {
+                  stopMessage();
+                } else {
+                  sendMessage();
+                }
               }
             }}
             placeholder="Scrivi un messaggio..."
@@ -243,22 +279,20 @@ export default function Home() {
           />
 
           <button
-            onClick={sendMessage}
-            disabled={loading}
+            onClick={loading ? stopMessage : sendMessage}
             style={{
               padding: "0 22px",
               borderRadius: "10px",
               border: "none",
-              cursor: loading ? "default" : "pointer",
+              cursor: "pointer",
               fontSize: "16px"
             }}
           >
-            {loading ? "..." : "Invia"}
+            {loading ? "⏹ Stop" : "Invia"}
           </button>
         </div>
       </div>
     </main>
   );
 }
-
 
