@@ -18,6 +18,7 @@ extractArchiveTool,
 
 import { sshTool } from "../../tools/ssh";
 import { fileInfoTool } from "../../tools/file-info";
+import { webExtractTool } from "../../tools/web-extract";
 
 export const runtime = "nodejs";
 
@@ -44,6 +45,7 @@ const agent = new Agent({
   tools: [
     webSearchTool,
     fetchUrlTool,
+    webExtractTool,
     listFilesTool,
     fileInfoTool,
     readFileTool,
