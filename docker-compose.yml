@@ -22,4 +22,6 @@ services:
       - "3000:3000"
     volumes:
       - ./data:/data
+      - ./gideon-data/knowledge:/knowledge
+      - ./gideon-data/memory:/memory
     restart: unless-stopped

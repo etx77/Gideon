@@ -20,6 +20,12 @@ import { sshTool } from "../../tools/ssh";
 import { fileInfoTool } from "../../tools/file-info";
 import { webExtractTool } from "../../tools/web-extract";
 
+import {
+  saveKnowledgeTool,
+  readKnowledgeTool,
+  searchKnowledgeTool,
+} from "../../tools/knowledge";
+
 export const runtime = "nodejs";
 
 const provider = new OpenAIProvider({
@@ -53,6 +59,9 @@ const agent = new Agent({
     listArchiveTool,
     extractArchiveTool,
     sshTool,
+    saveKnowledgeTool,
+    readKnowledgeTool,
+    searchKnowledgeTool,
   ],
 });
 
