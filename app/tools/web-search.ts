@@ -1,6 +1,5 @@
 import { tool } from "@openai/agents";
 import { z } from "zod";
-import * as cheerio from "cheerio";
 
 export const webSearchTool = tool({
   name: "web_search",
@@ -23,62 +22,48 @@ Restituisci i risultati della ricerca con titolo, URL e descrizione.
   }),
 
   async execute({ query }) {
-    const url =
-      "https://html.duckduckgo.com/html/?q=" +
-      encodeURIComponent(query);
-
-    const response = await fetch(url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
-      },
+    const params = new URLSearchParams({
+      text: query,
+      engines: "google,bing,duckduckgo",
+      limit: "8",
     });
+
+const response = await fetch(
+  `${process.env.OPENSERP_URL}/mega/search?` +
+    params.toString(),
+  {
+    headers: {
+      Accept: "application/json",
+    },
+    signal: AbortSignal.timeout(30000),
+  }
+);
 
     if (!response.ok) {
       throw new Error(
-        `Ricerca web fallita: HTTP ${response.status}`
+        "Ricerca web fallita: HTTP " + response.status
       );
     }
 
-    const html = await response.text();
-    const $ = cheerio.load(html);
+    const data = await response.json();
 
-    const results: {
-      title: string;
-      url: string;
-      snippet: string;
-    }[] = [];
-
-    $(".result").each((_, element) => {
-      const title = $(element)
-        .find(".result__a")
-        .first()
-        .text()
-        .trim();
-
-      const resultUrl = $(element)
-        .find(".result__a")
-        .first()
-        .attr("href");
-
-      const snippet = $(element)
-        .find(".result__snippet")
-        .first()
-        .text()
-        .trim();
-
-      if (title && resultUrl) {
-        results.push({
-          title,
-          url: resultUrl,
-          snippet,
-        });
-      }
-    });
+    const results = (data.results ?? [])
+      .filter(
+        (result: any) =>
+          result.type === "organic" &&
+          result.title &&
+          result.url
+      )
+      .slice(0, 8)
+      .map((result: any) => ({
+        title: result.title,
+        url: result.url,
+        snippet: result.snippet ?? "",
+      }));
 
     return JSON.stringify({
       query,
-      results: results.slice(0, 8),
+      results,
     });
   },
 });

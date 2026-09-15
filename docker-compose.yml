@@ -1,9 +1,23 @@
 services:
+  openserp:
+    image: karust/openserp:latest
+    container_name: openserp
+    command: ["serve", "-a", "0.0.0.0", "-p", "7000"]
+    expose:
+      - "7000"
+    restart: unless-stopped
+
   nvidia-chat:
     build: .
     container_name: nvidia-chat
     env_file:
       - .env
+    environment:
+      OPENSERP_URL: http://openserp:7000
+    depends_on:
+      - openserp
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "3000:3000"
     volumes:
