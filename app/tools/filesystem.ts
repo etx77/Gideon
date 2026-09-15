@@ -2,18 +2,42 @@ import { tool } from "@openai/agents";
 import { z } from "zod";
 import fs from "fs/promises";
 import path from "path";
+import { spawn } from "child_process";
+
 
 const BASE_DIR = "/data";
+
+const DEFAULT_MAX_RESULTS = 100;
+const MAX_RESULTS = 500;
+const MAX_CONTEXT_LINES = 20;
+const MAX_READ_LINES = 5000;
 
 function safePath(inputPath: string): string {
   const resolved = path.resolve(BASE_DIR, inputPath);
 
-  if (resolved !== BASE_DIR && !resolved.startsWith(BASE_DIR + path.sep)) {
+  if (
+    resolved !== BASE_DIR &&
+    !resolved.startsWith(BASE_DIR + path.sep)
+  ) {
     throw new Error("Percorso non consentito");
   }
 
   return resolved;
 }
+
+function relativePath(fullPath: string): string {
+  return path.relative(BASE_DIR, fullPath) || ".";
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+/*
+ * --------------------------------------------------------------------------
+ * list_files
+ * --------------------------------------------------------------------------
+ */
 
 export const listFilesTool = tool({
   name: "list_files",
@@ -27,8 +51,14 @@ Usa questo tool quando:
 - devi individuare file da analizzare
 
 Puoi leggere solamente contenuti sotto /data.
-`,
 
+Restituisce:
+- nome
+- tipo
+- percorso relativo
+- dimensione per i file
+`,
+  
   parameters: z.object({
     path: z
       .string()
@@ -36,33 +66,68 @@ Puoi leggere solamente contenuti sotto /data.
       .describe("Percorso relativo a /data"),
   }),
 
-  async execute({ path: relativePath }) {
-    const target = safePath(relativePath);
+  async execute({ path: relative }) {
+    const target = safePath(relative);
+
+    const stat = await fs.stat(target);
+
+    if (!stat.isDirectory()) {
+      throw new Error("Il percorso specificato non è una directory");
+    }
 
     const entries = await fs.readdir(target, {
       withFileTypes: true,
     });
 
-    const results = entries.map((entry) => ({
-      name: entry.name,
-      type: entry.isDirectory() ? "directory" : "file",
-    }));
+    const results = [];
+
+    for (const entry of entries) {
+      const fullPath = path.join(target, entry.name);
+
+      try {
+        const entryStat = await fs.stat(fullPath);
+
+        results.push({
+          name: entry.name,
+          path: relativePath(fullPath),
+          type: entry.isDirectory() ? "directory" : "file",
+          size: entry.isFile() ? entryStat.size : undefined,
+        });
+      } catch {
+        results.push({
+          name: entry.name,
+          path: relativePath(fullPath),
+          type: entry.isDirectory() ? "directory" : "file",
+        });
+      }
+    }
+
+    results.sort((a, b) => {
+      if (a.type !== b.type) {
+        return a.type === "directory" ? -1 : 1;
+      }
+
+      return a.name.localeCompare(b.name);
+    });
 
     return JSON.stringify({
-      path: relativePath,
+      path: relative || ".",
       results,
     });
   },
 });
 
+/*
+ * --------------------------------------------------------------------------
+ * read_file
+ * --------------------------------------------------------------------------
+ */
 
 export const readFileTool = tool({
   name: "read_file",
 
   description: `
 Legge il contenuto di un file disponibile sotto /data.
-
-Può leggere anche file molto grandi a blocchi.
 
 Usa questo tool quando devi:
 - leggere log
@@ -71,16 +136,17 @@ Usa questo tool quando devi:
 - leggere stack trace
 - leggere thread dump
 - analizzare file di testo
-- analizzare grandi file di log senza caricarli interamente
-
-Per file grandi usa offset e limit per leggere solamente la parte necessaria.
+- analizzare file grandi a blocchi
 
 Parametri:
-- offset: numero della riga da cui iniziare la lettura. La prima riga è 1.
-- limit: numero massimo di righe da leggere.
+- path: percorso relativo a /data
+- offset: prima riga da leggere, numerazione da 1
+- limit: numero massimo di righe
 
-Se offset e limit non vengono specificati, viene letto l'intero file
-solo se il file è sufficientemente piccolo.
+Per file grandi usa offset e limit.
+
+Il tool NON carica inutilmente l'intero file quando viene richiesto
+un intervallo specifico di righe.
 `,
 
   parameters: z.object({
@@ -93,23 +159,23 @@ solo se il file è sufficientemente piccolo.
       .int()
       .min(1)
       .default(1)
-      .describe("Numero della prima riga da leggere. La prima riga è 1."),
+      .describe("Numero della prima riga da leggere"),
 
     limit: z
       .number()
       .int()
       .min(1)
-      .max(5000)
+      .max(MAX_READ_LINES)
       .default(1000)
-      .describe("Numero massimo di righe da leggere."),
+      .describe("Numero massimo di righe da leggere"),
   }),
 
   async execute({
-    path: relativePath,
+    path: relative,
     offset,
     limit,
   }) {
-    const target = safePath(relativePath);
+    const target = safePath(relative);
 
     const stat = await fs.stat(target);
 
@@ -117,198 +183,379 @@ solo se il file è sufficientemente piccolo.
       throw new Error("Il percorso specificato non è un file");
     }
 
-    const MAX_DIRECT_READ = 5 * 1024 * 1024;
+    const startLine = offset;
+    const endLine = offset + limit - 1;
 
-    let content: string;
+    const lines: string[] = [];
 
-    if (stat.size <= MAX_DIRECT_READ) {
-      content = await fs.readFile(target, "utf8");
-    } else {
-      /*
-       * Per file grandi leggiamo comunque il file in streaming,
-       * evitando di caricarlo interamente nella memoria.
-       */
+    const fileHandle = await fs.open(target, "r");
 
-      const chunks: string[] = [];
-
-      const stream = (await import("fs")).createReadStream(target, {
-        encoding: "utf8",
-      });
+    try {
+      const stream = fileHandle.readLines();
 
       let currentLine = 1;
-      let collectedLines = 0;
-      let buffer = "";
 
-      for await (const chunk of stream) {
-        buffer += chunk;
-
-        const lines = buffer.split(/\r?\n/);
-
-        buffer = lines.pop() ?? "";
-
-        for (const line of lines) {
-          if (currentLine >= offset && collectedLines < limit) {
-            chunks.push(line);
-            collectedLines++;
-          }
-
-          currentLine++;
-
-          if (collectedLines >= limit) {
-            stream.destroy();
-            break;
-          }
+      for await (const line of stream) {
+        if (currentLine >= startLine && currentLine <= endLine) {
+          lines.push(line);
         }
 
-        if (collectedLines >= limit) {
+        if (currentLine > endLine) {
           break;
         }
+
+        currentLine++;
       }
 
-      if (
-        collectedLines < limit &&
-        buffer.length > 0 &&
-        currentLine >= offset
-      ) {
-        chunks.push(buffer);
-      }
+      const totalLinesKnown =
+        currentLine <= endLine ? currentLine - 1 : undefined;
 
-      content = chunks.join("\n");
+      return JSON.stringify({
+        path: relative,
+        size: stat.size,
+        offset,
+        limit,
+        linesRead: lines.length,
+        content: lines.join("\n"),
+        truncated: lines.length === limit,
+        totalLinesKnown,
+      });
+    } finally {
+      await fileHandle.close();
     }
-
-    const lines = content.split(/\r?\n/);
-
-    /*
-     * Per file piccoli applichiamo offset/limit dopo la lettura.
-     * Per file grandi il contenuto è già stato limitato durante lo stream.
-     */
-
-    const selectedLines =
-      stat.size <= MAX_DIRECT_READ
-        ? lines.slice(offset - 1, offset - 1 + limit)
-        : lines;
-
-    const actualStartLine = offset;
-
-    return JSON.stringify({
-      path: relativePath,
-      size: stat.size,
-      offset: actualStartLine,
-      limit,
-      linesRead: selectedLines.length,
-      content: selectedLines.join("\n"),
-      truncated:
-        actualStartLine + selectedLines.length - 1 <
-        lines.length + actualStartLine - 1,
-    });
   },
 });
 
+/*
+ * --------------------------------------------------------------------------
+ * search_files
+ * --------------------------------------------------------------------------
+ *
+ * La ricerca viene delegata a ripgrep.
+ *
+ * Questo evita:
+ * - readFile() dell'intero file
+ * - split() dell'intero contenuto
+ * - lowercase() di ogni riga
+ * - ricorsione manuale in JavaScript
+ *
+ * ripgrep gestisce direttamente:
+ * - ricerca ricorsiva
+ * - regex
+ * - case sensitivity
+ * - glob
+ * - file binari
+ * - contesto
+ * - ricerca veloce su directory grandi
+ */
 
 export const searchFilesTool = tool({
   name: "search_files",
 
   description: `
-Cerca una stringa nei file disponibili sotto /data.
+Cerca testo o regex nei file disponibili sotto /data.
 
-Usa questo tool quando l'utente vuole:
+Usa questo tool quando devi:
 - trovare errori nei log
 - cercare eccezioni
-- trovare una configurazione
-- cercare una parola o una stringa in più file
-- individuare rapidamente informazioni senza leggere tutti i file
+- trovare configurazioni
+- cercare una stringa in molti file
+- trovare rapidamente informazioni
+- analizzare grandi directory di log
+- cercare stack trace
+- cercare pattern tecnici con regex
 
-La ricerca è ricorsiva nelle sottodirectory.
+La ricerca viene eseguita tramite ripgrep.
 
-Restituisci:
+Parametri:
+- query: testo o regex da cercare
+- path: directory o file relativo a /data
+- regex: interpreta query come espressione regolare
+- case_sensitive: ricerca case-sensitive
+- max_results: massimo numero di match
+- context_before: righe precedenti al match
+- context_after: righe successive al match
+- file_pattern: filtro glob opzionale, ad esempio "*.log"
+
+I risultati contengono:
 - file
 - numero di riga
-- contenuto della riga trovata
+- contenuto
+- contesto quando richiesto
 
-Limita i risultati per evitare di restituire quantità eccessive di testo.
+La ricerca rimane confinata a /data.
 `,
 
   parameters: z.object({
     query: z
       .string()
       .min(1)
-      .describe("Testo da cercare"),
+      .describe("Testo o regex da cercare"),
 
     path: z
       .string()
       .default(".")
-      .describe("Directory relativa a /data in cui cercare"),
+      .describe("Directory o file relativo a /data"),
+
+    regex: z
+      .boolean()
+      .default(false)
+      .describe("Interpreta query come regex"),
+
+    case_sensitive: z
+      .boolean()
+      .default(false)
+      .describe("Ricerca case-sensitive"),
+
+    max_results: z
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_RESULTS)
+      .default(DEFAULT_MAX_RESULTS)
+      .describe("Numero massimo di risultati"),
+
+    context_before: z
+      .number()
+      .int()
+      .min(0)
+      .max(MAX_CONTEXT_LINES)
+      .default(0)
+      .describe("Numero di righe prima del match"),
+
+    context_after: z
+      .number()
+      .int()
+      .min(0)
+      .max(MAX_CONTEXT_LINES)
+      .default(0)
+      .describe("Numero di righe dopo il match"),
+
+    file_pattern: z
+      .string()
+      .optional()
+      .describe("Glob opzionale, ad esempio *.log"),
   }),
 
-  async execute({ query, path: relativePath }) {
-    const root = safePath(relativePath);
+  async execute({
+    query,
+    path: relative,
+    regex,
+    case_sensitive,
+    max_results,
+    context_before,
+    context_after,
+    file_pattern,
+  }) {
+        console.log("[SEARCH_FILES] START", {
+      query,
+      path: relative,
+      regex,
+      case_sensitive,
+      max_results,
+      context_before,
+      context_after,
+      file_pattern,
+    });
+    const target = safePath(relative);
 
-    const results: {
+    const stat = await fs.stat(target);
+
+    if (!stat.isFile() && !stat.isDirectory()) {
+      throw new Error("Percorso non valido");
+    }
+
+    const args: string[] = [
+      "--json",
+      "--no-heading",
+      "--line-number",
+      "--max-count",
+      String(max_results),
+    ];
+
+    /*
+     * Non seguiamo symlink esterni.
+     * In questo modo la ricerca resta confinata a /data.
+     */
+    args.push("--no-follow");
+
+    /*
+     * Ignora automaticamente file binari.
+     */
+
+
+    /*
+     * Mostra file nascosti solo quando esplicitamente richiesto
+     * in futuro. Per ora manteniamo il comportamento sicuro/default.
+     */
+
+    if (!case_sensitive) {
+      args.push("--ignore-case");
+    }
+
+    if (regex) {
+      args.push("--regexp", query);
+    } else {
+      args.push("--fixed-strings", "--regexp", query);
+    }
+
+    if (context_before > 0) {
+      args.push("--before-context", String(context_before));
+    }
+
+    if (context_after > 0) {
+      args.push("--after-context", String(context_after));
+    }
+
+
+    if (
+      file_pattern &&
+      file_pattern.trim() !== "" &&
+      file_pattern.toLowerCase() !== "none"
+    ) {
+      args.push("--glob", file_pattern);
+    }
+    /*
+     * Non interpretiamo automaticamente .gitignore:
+     * /data non è necessariamente un repository Git.
+     */
+
+    args.push(target);
+
+    const results: Array<{
       file: string;
       line: number;
       content: string;
-    }[] = [];
+      context?: string[];
+    }> = [];
 
-    async function walk(currentPath: string) {
-      if (results.length >= 100) {
-        return;
-      }
-
-      const entries = await fs.readdir(currentPath, {
-        withFileTypes: true,
+    let stderr = "";
+    let stdoutBuffer = "";
+    console.log("[SEARCH_FILES] RG START", {
+      command: "rg",
+      args,
+    });
+    const exitCode = await new Promise<number>((resolve, reject) => {
+      const child = spawn("rg", args, {
+        cwd: BASE_DIR,
+        stdio: ["ignore", "pipe", "pipe"],
       });
 
-      for (const entry of entries) {
-        if (results.length >= 100) {
-          return;
-        }
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
 
-        const fullPath = path.join(currentPath, entry.name);
+      child.stdout.on("data", (chunk: string) => {
+        stdoutBuffer += chunk;
 
-        if (entry.isDirectory()) {
-          await walk(fullPath);
-          continue;
-        }
+        const lines = stdoutBuffer.split("\n");
+        stdoutBuffer = lines.pop() ?? "";
 
-        if (!entry.isFile()) {
-          continue;
-        }
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          if (results.length >= max_results) break;
 
-        try {
-          const stat = await fs.stat(fullPath);
+          try {
+            const event = JSON.parse(line);
 
-          if (stat.size > 5 * 1024 * 1024) {
-            continue;
-          }
+            if (event.type === "match") {
+              const data = event.data;
 
-          const content = await fs.readFile(fullPath, "utf8");
-          const lines = content.split(/\r?\n/);
+              const filePath = data.path?.text ?? "";
+              const lineNumber = data.line_number ?? 0;
 
-          lines.forEach((line, index) => {
-            if (
-              results.length < 100 &&
-              line.toLowerCase().includes(query.toLowerCase())
-            ) {
+              const content =
+                typeof data.lines?.text === "string"
+                  ? data.lines.text.replace(/\r?\n$/, "")
+                  : "";
+
               results.push({
-                file: path.relative(BASE_DIR, fullPath),
-                line: index + 1,
-                content: line.trim(),
+                file: path.relative(BASE_DIR, filePath),
+                line: lineNumber,
+                content,
               });
             }
-          });
-        } catch {
-          // Ignora file non leggibili o non testuali
+          } catch {
+            // Ignora eventuali righe JSON non valide.
+          }
         }
-      }
+      });
+
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+
+      child.on("error", reject);
+
+    child.on("close", (code) => {
+      console.log("[SEARCH_FILES] RG EXIT", {
+        exitCode: code,
+        results: results.length,
+        stderr: stderr.trim(),
+      });
+
+      resolve(code ?? 1);
+    });
+    });
+
+    /*
+     * rg:
+     *
+     * 0 = almeno un match
+     * 1 = nessun match
+     * 2 = errore
+     */
+
+    if (exitCode === 2) {
+      throw new Error(
+        `Errore ripgrep: ${stderr.trim() || "errore sconosciuto"}`
+      );
     }
 
-    await walk(root);
+    /*
+     * ripgrep può avere ancora un ultimo record senza newline.
+     */
+    if (
+      stdoutBuffer.trim() &&
+      results.length < max_results
+    ) {
+      try {
+        const event = JSON.parse(stdoutBuffer);
+
+        if (event.type === "match") {
+          const data = event.data;
+
+          results.push({
+            file: path.relative(
+              BASE_DIR,
+              data.path?.text ?? ""
+            ),
+            line: data.line_number ?? 0,
+            content:
+              typeof data.lines?.text === "string"
+                ? data.lines.text.replace(/\r?\n$/, "")
+                : "",
+          });
+        }
+      } catch {
+        // Ignora record finale non valido.
+      }
+    }
+    console.log("[SEARCH_FILES] END", {
+      query,
+      results: results.length,
+      exitCode,
+    });
 
     return JSON.stringify({
       query,
-      path: relativePath,
-      results,
-      truncated: results.length >= 100,
+      path: relative,
+      regex,
+      caseSensitive: case_sensitive,
+      results: results.slice(0, clamp(max_results, 1, MAX_RESULTS)),
+      count: results.length,
+      truncated: results.length >= max_results,
+      exitCode,
+      stderr: stderr.trim() || undefined,
     });
   },
 });

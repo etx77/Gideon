@@ -47,7 +47,7 @@ export async function POST(request: Request) {
     const messages = body.messages ?? [];
 
     const agent = new Agent({
-      name: "NVIDIA Coding Assistant",
+      name: "Gideon",
 
       instructions,
 
